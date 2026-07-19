@@ -4,7 +4,16 @@ A standalone gateway that sits in front of any backend, enforcing per-client rat
 limits correctly even when the gateway itself is scaled to multiple instances behind
 a load balancer — which is exactly the case a naive rate limiter gets wrong.
 
-**Live demo:** _see [Deployment](#deployment)._
+**Live demo:** https://rate-limiter-gateway-bgb7.onrender.com (gateway) proxying to
+https://rate-limiter-mock-upstream.onrender.com (mock upstream), both on Render's
+free tier — see the cold-start caveat in [Deployment](#deployment). Try it:
+
+```bash
+curl -i https://rate-limiter-gateway-bgb7.onrender.com/api/fw/hello -H "X-API-Key: demo"
+```
+
+Send it 21+ times in a row (`for i in {1..25}; do curl -s -o /dev/null -w "%{http_code} " ...; done`)
+and watch it start returning `429` after the 20th.
 
 ## The problem
 
@@ -193,10 +202,25 @@ curl http://localhost:8080/metrics                              # Prometheus for
 
 ## Deployment
 
-Backend on Render (free web service). `RATE_LIMIT`, `RATE_WINDOW_SECONDS`,
-`REDIS_URL`, `UPSTREAM_URL` set as environment variables — see `.env.example`.
+**What's actually running:** two separate Render free web services — `rate-limiter-gateway`
+and `rate-limiter-mock-upstream` — both deployed from this repo's `main` branch, plus
+a shared free-tier Redis instance (reused from another one of my projects; its key
+namespace here — `tb:*`/`sw:*`/`fw:*` — doesn't collide with anything else using that
+instance). `RATE_LIMIT`, `RATE_WINDOW_SECONDS`, `REDIS_URL`, `UPSTREAM_URL` are set as
+Render environment variables — see `.env.example` for the full list.
 
-Locally, `docker-compose.yml` runs the full picture: two gateway replicas
+**Known trade-off of the free-tier deployment:** Render's free web services spin down
+after 15 minutes idle; the first request after that takes ~30-50s to cold-start. If
+the curl command above hangs for a bit on your first try, that's why — not a bug.
+The gateway's own rate limiting is unaffected either way, since it's enforced in
+Redis, not in the gateway process's memory.
+
+**To deploy your own copy:** provision Redis, deploy `src/mockUpstream.ts` (or your
+own real backend) as one service, deploy the gateway as a second long-lived Node
+process pointed at it via `UPSTREAM_URL`, and you're done — no database, no
+migrations, just the one Redis dependency.
+
+**Locally**, `docker-compose.yml` runs the full picture: two gateway replicas
 (`gateway-a`, `gateway-b`) sharing one Redis, a mock upstream, Prometheus scraping
 both replicas, and Grafana on top — `docker compose up` reproduces the multi-instance
 story from decision #1 as an actual running system, not just a test script.
