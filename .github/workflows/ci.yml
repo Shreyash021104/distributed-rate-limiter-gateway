@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      REDIS_URL: redis://localhost:6379
+      UPSTREAM_URL: http://localhost:9000
+      MOCK_UPSTREAM_PORT: 9000
+      PORT: 8080
+      RATE_LIMIT: 5
+      RATE_WINDOW_SECONDS: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build
+
+      - name: Run multi-instance correctness test
+        run: npm run test:multi-instance
+
+      - name: Run boundary-burst comparison test
+        run: npm run test:boundary-burst
+
+      - name: Start mock upstream and gateway for k6 load test
+        run: |
+          npm run mock-upstream &
+          npm run dev &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/health && break
+            sleep 1
+          done
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+
+      - name: Run k6 load test comparing all three algorithms
+        uses: grafana/run-k6-action@v1
+        with:
+          path: loadtest/compare-algorithms.js
