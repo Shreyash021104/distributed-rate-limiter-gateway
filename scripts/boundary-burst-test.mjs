@@ -19,12 +19,13 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 const ROOT = path.join(import.meta.dirname, "..");
+const TSX_BIN = path.join(ROOT, "node_modules", ".bin", "tsx");
 const LIMIT = 5;
 const WINDOW_SECONDS = 2;
 const WINDOW_MS = WINDOW_SECONDS * 1000;
 
 function spawnProcess(name, scriptPath, env) {
-  const child = spawn("npx", ["tsx", scriptPath], {
+  const child = spawn(TSX_BIN, [scriptPath], {
     cwd: ROOT,
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],

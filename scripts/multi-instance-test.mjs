@@ -16,11 +16,17 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 const ROOT = path.join(import.meta.dirname, "..");
+const TSX_BIN = path.join(ROOT, "node_modules", ".bin", "tsx");
 const LIMIT = 5;
 const WINDOW_SECONDS = 10;
 
 function spawnProcess(name, scriptPath, env) {
-  const child = spawn("npx", ["tsx", scriptPath], {
+  // Invoke the locally-installed tsx binary directly rather than going
+  // through `npx tsx` — npx's resolution behaves differently across
+  // environments (it hung indefinitely in GitHub Actions CI despite
+  // working fine locally, even though tsx is already a devDependency and
+  // should never need to be fetched).
+  const child = spawn(TSX_BIN, [scriptPath], {
     cwd: ROOT,
     env: { ...process.env, ...env },
     stdio: ["ignore", "pipe", "pipe"],
