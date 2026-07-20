@@ -4,6 +4,12 @@ A standalone gateway that sits in front of any backend, enforcing per-client rat
 limits correctly even when the gateway itself is scaled to multiple instances behind
 a load balancer — which is exactly the case a naive rate limiter gets wrong.
 
+<p align="center">
+  <img src="docs/demo.gif" alt="Live rate limiting: requests allowed then 429'd, plus the multi-instance and boundary-burst correctness tests passing" width="100%" />
+  <br>
+  <em>Live traffic hitting the limit, and the correctness tests that prove it. (<a href="docs/demo.mp4">full-quality video</a>)</em>
+</p>
+
 **Live demo:** https://rate-limiter-gateway-bgb7.onrender.com (gateway) proxying to
 https://rate-limiter-mock-upstream.onrender.com (mock upstream), both on Render's
 free tier — see the cold-start caveat in [Deployment](#deployment). Try it:
