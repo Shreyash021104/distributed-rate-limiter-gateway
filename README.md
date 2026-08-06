@@ -10,16 +10,18 @@ a load balancer — which is exactly the case a naive rate limiter gets wrong.
   <em>Live traffic hitting the limit, and the correctness tests that prove it. (<a href="docs/demo.mp4">full-quality video</a>)</em>
 </p>
 
-**Live demo:** https://rate-limiter-gateway-bgb7.onrender.com (gateway) proxying to
-https://rate-limiter-mock-upstream.onrender.com (mock upstream), both on Render's
-free tier — see the cold-start caveat in [Deployment](#deployment). Try it:
+**Try it in 30 seconds** (see it live in the demo above, or run it yourself):
 
 ```bash
-curl -i https://rate-limiter-gateway-bgb7.onrender.com/api/fw/hello -H "X-API-Key: demo"
+docker compose up          # starts the gateway + a mock upstream + Redis
+curl -i http://localhost:8080/api/fw/hello -H "X-API-Key: demo"
 ```
 
-Send it 21+ times in a row (`for i in {1..25}; do curl -s -o /dev/null -w "%{http_code} " ...; done`)
-and watch it start returning `429` after the 20th.
+Send it 21+ times in a row and watch it start returning `429` after the 20th:
+
+```bash
+for i in {1..25}; do curl -s -o /dev/null -w "%{http_code} " http://localhost:8080/api/fw/hello -H "X-API-Key: demo"; done
+```
 
 ## The problem
 
@@ -208,7 +210,7 @@ curl http://localhost:8080/metrics                              # Prometheus for
 
 ## Deployment
 
-**What's actually running:** two separate Render free web services — `rate-limiter-gateway`
+**How it's deployed:** two separate Render free web services — `rate-limiter-gateway`
 and `rate-limiter-mock-upstream` — both deployed from this repo's `main` branch, plus
 a shared free-tier Redis instance (reused from another one of my projects; its key
 namespace here — `tb:*`/`sw:*`/`fw:*` — doesn't collide with anything else using that
