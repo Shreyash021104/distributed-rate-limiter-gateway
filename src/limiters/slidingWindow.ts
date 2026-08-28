@@ -1,13 +1,8 @@
 import type { Redis } from "ioredis";
 import { randomUUID } from "node:crypto";
 import { redis } from "../redis.js";
-import { loadScript } from "./loadScript.js";
+import { registerScript } from "./registerScript.js";
 import type { Limiter, LimitResult } from "./types.js";
-
-redis.defineCommand("slidingWindowLog", {
-  numberOfKeys: 1,
-  lua: loadScript("slidingWindowLog.lua"),
-});
 
 declare module "ioredis" {
   interface RedisCommander<Context> {
@@ -17,7 +12,7 @@ declare module "ioredis" {
       limit: string,
       now: string,
       member: string
-    ): Promise<[number, number]>;
+    ): Promise<[number, number, number, number]>;
   }
 }
 
@@ -28,11 +23,15 @@ export interface SlidingWindowOptions {
 
 export class SlidingWindowLimiter implements Limiter {
   readonly algorithm = "sliding-window" as const;
+  readonly limit: number;
 
   constructor(
     private readonly options: SlidingWindowOptions,
     private readonly client: Redis = redis
-  ) {}
+  ) {
+    this.limit = options.limit;
+    registerScript(this.client, "slidingWindowLog", "slidingWindowLog.lua", 1);
+  }
 
   async check(key: string): Promise<LimitResult> {
     const now = Date.now();
@@ -41,7 +40,7 @@ export class SlidingWindowLimiter implements Limiter {
     // using the timestamp alone as the sorted-set member would silently
     // collapse them into a single log entry and undercount.
     const member = `${now}:${randomUUID()}`;
-    const [allowed, count] = await this.client.slidingWindowLog(
+    const [allowed, count, retryAfterMs, resetMs] = await this.client.slidingWindowLog(
       `sw:${key}`,
       String(this.options.windowMs),
       String(this.options.limit),
@@ -50,8 +49,10 @@ export class SlidingWindowLimiter implements Limiter {
     );
     return {
       allowed: allowed === 1,
+      limit: this.limit,
       remaining: Math.max(0, this.options.limit - count),
-      retryAfterMs: allowed === 1 ? 0 : this.options.windowMs,
+      retryAfterMs,
+      resetMs,
     };
   }
 }

@@ -1,15 +1,18 @@
 {
   "name": "02-rate-limiter-gateway",
   "version": "1.0.0",
-  "description": "",
+  "description": "Distributed rate limiter and API gateway: three algorithms enforced atomically across multiple instances via Redis Lua scripts.",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "mock-upstream": "tsx watch src/mockUpstream.ts",
-    "build": "tsc",
+    "build": "tsc && node -e \"require('node:fs').cpSync('src/scripts','dist/scripts',{recursive:true})\"",
     "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx --test test/limiters.test.ts test/middleware.test.ts",
     "test:multi-instance": "node scripts/multi-instance-test.mjs",
-    "test:boundary-burst": "node scripts/boundary-burst-test.mjs"
+    "test:boundary-burst": "node scripts/boundary-burst-test.mjs",
+    "test:redis-outage": "node scripts/redis-outage-test.mjs"
   },
   "keywords": [],
   "author": "",

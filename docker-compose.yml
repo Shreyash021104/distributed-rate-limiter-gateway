@@ -14,6 +14,13 @@ services:
     command: ["node", "dist/mockUpstream.js"]
     environment:
       MOCK_UPSTREAM_PORT: 9000
+    healthcheck:
+      # The image's own HEALTHCHECK probes $PORT, which is the gateway's port,
+      # not this service's — so it gets its own.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:9000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     ports:
       - "9000:9000"
 
@@ -22,13 +29,13 @@ services:
   # with the same X-API-Key and the rate limit is still enforced globally,
   # not per-instance — see scripts/multi-instance-test.mjs for the automated
   # version of this same proof.
-  gateway-a:
+  gateway-a: &gateway
     build: .
     depends_on:
       redis:
         condition: service_healthy
       mock-upstream:
-        condition: service_started
+        condition: service_healthy
     environment:
       PORT: 8080
       REDIS_URL: redis://redis:6379
@@ -36,16 +43,16 @@ services:
       RATE_LIMIT: 20
       RATE_WINDOW_SECONDS: 10
       INSTANCE_ID: gateway-a
+      # No real proxy in front of these containers, so req.ip is already the
+      # client's address. Behind a load balancer this must be set to the
+      # number of proxy hops or IP-keyed limits bucket every anonymous caller
+      # together — see the note in src/env.ts.
+      TRUST_PROXY: 0
     ports:
       - "8080:8080"
 
   gateway-b:
-    build: .
-    depends_on:
-      redis:
-        condition: service_healthy
-      mock-upstream:
-        condition: service_started
+    <<: *gateway
     environment:
       PORT: 8080
       REDIS_URL: redis://redis:6379
@@ -53,6 +60,7 @@ services:
       RATE_LIMIT: 20
       RATE_WINDOW_SECONDS: 10
       INSTANCE_ID: gateway-b
+      TRUST_PROXY: 0
     ports:
       - "8081:8080"
 
@@ -74,5 +82,13 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # Land on the gateway dashboard instead of an empty home page.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/gateway.json
+    volumes:
+      # Datasource and dashboard are provisioned from the repo, so
+      # `docker compose up` gives you a populated dashboard rather than a
+      # fresh Grafana asking you to wire one up by hand.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus

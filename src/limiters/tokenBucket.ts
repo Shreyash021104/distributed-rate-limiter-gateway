@@ -1,15 +1,7 @@
 import type { Redis } from "ioredis";
 import { redis } from "../redis.js";
-import { loadScript } from "./loadScript.js";
+import { registerScript } from "./registerScript.js";
 import type { Limiter, LimitResult } from "./types.js";
-
-// ioredis's defineCommand registers the script once and transparently uses
-// EVALSHA (falling back to EVAL on a cache miss, e.g. after a Redis
-// restart) — we don't have to hand-roll that caching ourselves.
-redis.defineCommand("tokenBucket", {
-  numberOfKeys: 1,
-  lua: loadScript("tokenBucket.lua"),
-});
 
 declare module "ioredis" {
   interface RedisCommander<Context> {
@@ -19,7 +11,7 @@ declare module "ioredis" {
       refillRate: string,
       now: string,
       requested: string
-    ): Promise<[number, string, number]>;
+    ): Promise<[number, string, number, number]>;
   }
 }
 
@@ -30,14 +22,18 @@ export interface TokenBucketOptions {
 
 export class TokenBucketLimiter implements Limiter {
   readonly algorithm = "token-bucket" as const;
+  readonly limit: number;
 
   constructor(
     private readonly options: TokenBucketOptions,
     private readonly client: Redis = redis
-  ) {}
+  ) {
+    this.limit = options.capacity;
+    registerScript(this.client, "tokenBucket", "tokenBucket.lua", 1);
+  }
 
   async check(key: string): Promise<LimitResult> {
-    const [allowed, tokensRemaining, retryAfterMs] = await this.client.tokenBucket(
+    const [allowed, tokensRemaining, retryAfterMs, resetMs] = await this.client.tokenBucket(
       `tb:${key}`,
       String(this.options.capacity),
       String(this.options.refillRatePerSecond),
@@ -46,8 +42,10 @@ export class TokenBucketLimiter implements Limiter {
     );
     return {
       allowed: allowed === 1,
+      limit: this.limit,
       remaining: Number(tokensRemaining),
       retryAfterMs,
+      resetMs,
     };
   }
 }
