@@ -43,6 +43,10 @@ services:
       RATE_LIMIT: 20
       RATE_WINDOW_SECONDS: 10
       INSTANCE_ID: gateway-a
+      # Non-zero so `docker compose up` demonstrates the readiness drain:
+      # /ready flips to 503 and traffic keeps being served for 3s before the
+      # listener closes.
+      READINESS_DRAIN_MS: 3000
       # No real proxy in front of these containers, so req.ip is already the
       # client's address. Behind a load balancer this must be set to the
       # number of proxy hops or IP-keyed limits bucket every anonymous caller
@@ -60,6 +64,7 @@ services:
       RATE_LIMIT: 20
       RATE_WINDOW_SECONDS: 10
       INSTANCE_ID: gateway-b
+      READINESS_DRAIN_MS: 3000
       TRUST_PROXY: 0
     ports:
       - "8081:8080"

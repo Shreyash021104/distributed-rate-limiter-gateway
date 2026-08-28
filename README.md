@@ -207,9 +207,52 @@ The first column is the only one the gateway is accountable for, and the right n
 comparing algorithms against each other. The second is what a client actually experiences.
 Reporting the first as if it were the second makes the gateway look ~5x faster than it is.
 
+### 5. The gateway needs protecting from the things it's protecting
+
+A gateway sits between two parties it doesn't control, and it was trusting both of them
+more than it should have. Three separate versions of the same mistake, each found by
+pointing something hostile at a running instance rather than by reading the code:
+
+**A hung upstream held gateway sockets forever.** Not a *slow* upstream — one that
+accepts the connection and then never answers, which is what a saturated backend
+actually looks like. There was no `proxyTimeout`, so the gateway waited indefinitely;
+in the measurement the client gave up first, at 25 seconds. The component whose entire
+purpose is protecting the backend had no protection *from* the backend, and would
+exhaust its own connections on behalf of a service already failing. Now bounded by
+`UPSTREAM_TIMEOUT_MS`, returning a counted 504 in ~1s.
+
+Worth noting the shape of that fix, because the obvious version is wrong: setting
+http-proxy-middleware's `timeout` alongside `proxyTimeout` made it *worse*. `timeout`
+applies to the incoming socket, and it fired first and destroyed the connection without
+ever reaching the error handler — the client got a dead socket instead of a 504, and
+nothing was logged or counted. Slow clients and slow upstreams are different problems;
+only one of them is what this deadline is for.
+
+**Clients could dictate Redis key size.** The API key header goes straight into the Redis
+key, with no bound on its length. A 7,000-character header produced a 7,018-byte Redis
+key, and was accepted — every distinct value buying another one. A rate limiter, of all
+things, turned into a memory amplifier aimed at the store it depends on. Key material is
+now capped at 128 characters, with anything longer hashed: bounded, but still a stable
+per-client bucket, so an unusual-but-legitimate key is limited consistently instead of
+being handed a fresh bucket per request. Ordinary keys stay readable — hashing everything
+would make every key in Redis opaque to debug for no added safety.
+
+**Readiness was reporting the wrong thing during a deploy.** `/ready` correctly flipped to
+503 on SIGTERM — and then `server.close()` ran immediately, so health checks got a
+connection refusal rather than that 503. The load balancer learned the instance was going
+away by failing a real request instead of by failing a probe, which is the exact
+client-visible error the probe exists to prevent. `READINESS_DRAIN_MS` now keeps the
+listener open, still serving traffic, while reporting not-ready — verified as 503 on
+`/ready` and 200 on live requests, simultaneously.
+
+One thing I expected to find here and didn't: keep-alive connections blocking graceful
+shutdown, which is a real bug in this pattern on older Node. Node 19 changed
+`server.close()` to drop idle connections, and a direct test confirmed a held-open
+keep-alive socket doesn't delay exit on Node 22. Left alone rather than "fixed."
+
 ## Verifying it yourself
 
-Unit tests cover the limiters directly — each algorithm's boundaries, and an atomicity
+Nineteen unit tests cover the limiters directly — each algorithm's boundaries, and an atomicity
 test that fires 50 simultaneous checks at one key and asserts exactly `limit` get
 through (a read-decide-write implementation passes every sequential test and fails that
 one). They run against a real Redis rather than a mock, because the logic under test
@@ -319,6 +362,11 @@ so with the default setting every anonymous caller in the world shares one bucke
 to the number of proxy hops in front of the gateway (`1` on Render). Not to `true`: that
 trusts the whole `X-Forwarded-For` chain, which lets a client prepend a fake address and
 mint itself a fresh bucket per request.
+
+**`READINESS_DRAIN_MS` is the other deployment-shaped one** — it defaults to 0 so local
+runs exit instantly, which is the wrong value behind a load balancer. Set it to at least
+twice the health-check interval so the balancer sees `/ready` return 503 and stops
+routing before the socket closes (see decision #5).
 
 **Known trade-off of the free-tier deployment:** Render's free web services spin down
 after 15 minutes idle; the first request after that takes ~30-50s to cold-start. If

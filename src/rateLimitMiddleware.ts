@@ -1,4 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
+import { createHash } from "node:crypto";
 import type { Limiter } from "./limiters/types.js";
 import {
   requestsTotal,
@@ -16,9 +17,27 @@ import {
 // the real deployment (see env.ts) — behind a load balancer with the default
 // setting, req.ip is the balancer's address and every anonymous client in
 // the world lands in one shared bucket.
+// Whatever the client sends becomes part of a Redis key, so its length can't
+// be the client's choice. Unbounded, a caller can send a 16KB API key header
+// (Node's limit) and mint a 16KB Redis key per request, each with a distinct
+// value — turning a rate limiter, of all things, into a memory amplifier
+// pointed at the store it depends on. Measured before this cap: a 7,000
+// character header produced a 7,018 byte Redis key and was accepted.
+//
+// Oversized values are hashed rather than rejected: the point is to bound the
+// key, not to guess which long strings are legitimate. A hash keeps the
+// mapping stable, so an unusual-but-real key is still limited consistently
+// instead of being handed a fresh bucket per request.
+const MAX_KEY_MATERIAL_LENGTH = 128;
+
+function boundKeyMaterial(value: string): string {
+  if (value.length <= MAX_KEY_MATERIAL_LENGTH) return value;
+  return `h:${createHash("sha256").update(value).digest("base64url")}`;
+}
+
 function clientKey(req: Request): string {
   const apiKey = req.header("x-api-key");
-  return apiKey ? `key:${apiKey}` : `ip:${req.ip}`;
+  return apiKey ? `key:${boundKeyMaterial(apiKey)}` : `ip:${boundKeyMaterial(req.ip ?? "unknown")}`;
 }
 
 // Which flavor of Redis failure caused a fail-open. Worth splitting: a
