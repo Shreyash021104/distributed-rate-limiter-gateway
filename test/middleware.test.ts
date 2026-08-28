@@ -14,8 +14,11 @@ import type { Limiter, LimitResult } from "../src/limiters/types.js";
 class StubLimiter implements Limiter {
   readonly algorithm = "fixed-window" as const;
   readonly limit = 3;
+  /** The key the middleware derived for the most recent request. */
+  lastKey = "";
   constructor(private readonly behavior: () => Promise<LimitResult>) {}
-  check(): Promise<LimitResult> {
+  check(key: string): Promise<LimitResult> {
+    this.lastKey = key;
     return this.behavior();
   }
 }
@@ -86,6 +89,39 @@ describe("rate limit headers", () => {
     const body = (await res.json()) as { retryAfterMs: number; algorithm: string };
     assert.equal(body.retryAfterMs, 4200);
     assert.equal(body.algorithm, "fixed-window");
+  });
+});
+
+describe("key derivation", () => {
+  it("bounds key material a client controls, so it cannot dictate Redis key size", async () => {
+    // Whatever the caller sends ends up inside a Redis key. Unbounded, a
+    // client can send a 16KB header (Node's limit) and mint a 16KB Redis key
+    // per distinct value — a rate limiter turned into a memory amplifier
+    // aimed at the store it depends on. Measured before the cap: a 7,000
+    // character header produced a 7,018 byte key.
+    const huge = "A".repeat(7000);
+    const res = await fetch(`${baseUrl}/allow`, { headers: { "X-API-Key": huge } });
+    assert.equal(res.status, 200, "an unusual key should still be served, just bounded");
+    assert.ok(
+      allowing.lastKey.length < 128,
+      `key material should be bounded, got ${allowing.lastKey.length} characters`
+    );
+    assert.ok(!allowing.lastKey.includes(huge), "the raw oversized value must not reach Redis");
+  });
+
+  it("keeps normal keys readable rather than hashing everything", async () => {
+    // Hashing unconditionally would make every Redis key opaque, which costs
+    // real debugging time for no benefit — the problem is only unbounded
+    // length.
+    await fetch(`${baseUrl}/allow`, { headers: { "X-API-Key": "customer-42" } });
+    assert.equal(allowing.lastKey, "key:customer-42");
+  });
+
+  it("gives two different oversized keys two different buckets", async () => {
+    await fetch(`${baseUrl}/allow`, { headers: { "X-API-Key": "B".repeat(7000) } });
+    const first = allowing.lastKey;
+    await fetch(`${baseUrl}/allow`, { headers: { "X-API-Key": "C".repeat(7000) } });
+    assert.notEqual(first, allowing.lastKey, "distinct clients must not collapse into one bucket");
   });
 });
 

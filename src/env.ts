@@ -97,7 +97,23 @@ const parsed = {
   redisCommandTimeoutMs: num("REDIS_COMMAND_TIMEOUT_MS", 250, { min: 10 }),
   redisConnectTimeoutMs: num("REDIS_CONNECT_TIMEOUT_MS", 1000, { min: 50 }),
 
-  // How long to let in-flight requests finish on SIGTERM before forcing exit.
+  // How long the gateway waits on the upstream before giving up. Without a
+  // ceiling here, an upstream that accepts connections but never answers
+  // holds gateway sockets open indefinitely — the component whose job is to
+  // protect the backend has no protection from the backend.
+  upstreamTimeoutMs: num("UPSTREAM_TIMEOUT_MS", 30_000, { min: 100 }),
+
+  // How long to keep serving, while reporting /ready as 503, before closing
+  // the listening socket on SIGTERM. Closing immediately makes the readiness
+  // flag unobservable: new probes get a connection refusal rather than a 503,
+  // so the load balancer learns the instance is going away by failing a real
+  // request instead of by failing a health check. Behind a balancer this
+  // wants to be at least twice the health-check interval. Defaults to 0 so
+  // local development and the test scripts still exit instantly.
+  readinessDrainMs: num("READINESS_DRAIN_MS", 0, { min: 0 }),
+
+  // How long to let in-flight requests finish once the socket is closed,
+  // before forcing exit.
   shutdownGraceMs: num("SHUTDOWN_GRACE_MS", 10_000, { min: 0 }),
 
   instanceId: required("INSTANCE_ID", `instance-${process.pid}`),
