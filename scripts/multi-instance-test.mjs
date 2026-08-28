@@ -12,43 +12,10 @@
 //
 // Usage: node scripts/multi-instance-test.mjs
 
-import { spawn } from "node:child_process";
-import path from "node:path";
+import { spawnProcess, waitForHealthy, killAll } from "./lib/harness.mjs";
 
-const ROOT = path.join(import.meta.dirname, "..");
-const TSX_BIN = path.join(ROOT, "node_modules", ".bin", "tsx");
 const LIMIT = 5;
 const WINDOW_SECONDS = 10;
-
-function spawnProcess(name, scriptPath, env) {
-  // Invoke the locally-installed tsx binary directly rather than going
-  // through `npx tsx` — npx's resolution behaves differently across
-  // environments (it hung indefinitely in GitHub Actions CI despite
-  // working fine locally, even though tsx is already a devDependency and
-  // should never need to be fetched).
-  const child = spawn(TSX_BIN, [scriptPath], {
-    cwd: ROOT,
-    env: { ...process.env, ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout.on("data", (d) => process.stdout.write(`[${name}] ${d}`));
-  child.stderr.on("data", (d) => process.stderr.write(`[${name}] ${d}`));
-  return child;
-}
-
-async function waitForHealthy(url, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return;
-    } catch {
-      // not up yet
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`${url} never became healthy`);
-}
 
 async function main() {
   const upstream = spawnProcess("upstream", "src/mockUpstream.ts", {
@@ -68,12 +35,6 @@ async function main() {
     RATE_WINDOW_SECONDS: String(WINDOW_SECONDS),
     INSTANCE_ID: "test-instance-B",
   });
-
-  const cleanup = () => {
-    upstream.kill();
-    gatewayA.kill();
-    gatewayB.kill();
-  };
 
   try {
     await waitForHealthy("http://localhost:9100/health");
@@ -116,7 +77,7 @@ async function main() {
         `no per-instance quota multiplication.`
     );
   } finally {
-    cleanup();
+    killAll(upstream, gatewayA, gatewayB);
   }
 }
 

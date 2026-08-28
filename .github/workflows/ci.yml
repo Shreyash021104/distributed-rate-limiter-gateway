@@ -38,17 +38,26 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck
-        run: npx tsc --noEmit
+      - name: Typecheck (source and tests)
+        run: npm run typecheck
 
       - name: Build
         run: npm run build
+
+      - name: Unit tests (limiters against a real Redis, plus HTTP contract)
+        run: npm test
 
       - name: Run multi-instance correctness test
         run: npm run test:multi-instance
 
       - name: Run boundary-burst comparison test
         run: npm run test:boundary-burst
+
+      # Points a gateway at a Redis that isn't there and asserts requests are
+      # still served, and served *fast*. Guards the regression where fail-open
+      # technically worked but took seconds per request.
+      - name: Run Redis-outage fail-open test
+        run: npm run test:redis-outage
 
       - name: Start mock upstream and gateway for k6 load test
         run: |

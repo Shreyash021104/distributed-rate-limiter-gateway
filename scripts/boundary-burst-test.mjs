@@ -15,39 +15,11 @@
 //
 // Usage: node scripts/boundary-burst-test.mjs
 
-import { spawn } from "node:child_process";
-import path from "node:path";
+import { spawnProcess, waitForHealthy, killAll, sleep } from "./lib/harness.mjs";
 
-const ROOT = path.join(import.meta.dirname, "..");
-const TSX_BIN = path.join(ROOT, "node_modules", ".bin", "tsx");
 const LIMIT = 5;
 const WINDOW_SECONDS = 2;
 const WINDOW_MS = WINDOW_SECONDS * 1000;
-
-function spawnProcess(name, scriptPath, env) {
-  const child = spawn(TSX_BIN, [scriptPath], {
-    cwd: ROOT,
-    env: { ...process.env, ...env },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  child.stdout.on("data", (d) => process.stdout.write(`[${name}] ${d}`));
-  child.stderr.on("data", (d) => process.stderr.write(`[${name}] ${d}`));
-  return child;
-}
-
-async function waitForHealthy(url, timeoutMs = 15000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return;
-    } catch {
-      // not up yet
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  throw new Error(`${url} never became healthy`);
-}
 
 async function fireBatch(url, apiKey, count) {
   let allowed = 0;
@@ -64,7 +36,7 @@ async function waitUntilNearWindowBoundary(marginMs = 150) {
   const msIntoWindow = Date.now() % WINDOW_MS;
   const msUntilBoundary = WINDOW_MS - msIntoWindow;
   const waitMs = Math.max(0, msUntilBoundary - marginMs);
-  await new Promise((r) => setTimeout(r, waitMs));
+  await sleep(waitMs);
 }
 
 async function main() {
@@ -77,11 +49,6 @@ async function main() {
     INSTANCE_ID: "boundary-test",
   });
 
-  const cleanup = () => {
-    upstream.kill();
-    gateway.kill();
-  };
-
   try {
     await waitForHealthy("http://localhost:9200/health");
     await waitForHealthy("http://localhost:8280/health");
@@ -90,7 +57,7 @@ async function main() {
     const fwKey = `boundary-fw-${Date.now()}`;
     await waitUntilNearWindowBoundary();
     const fwBatch1 = await fireBatch("http://localhost:8280/api/fw/test", fwKey, LIMIT);
-    await new Promise((r) => setTimeout(r, 300)); // cross the window boundary
+    await sleep(300); // cross the window boundary
     const fwBatch2 = await fireBatch("http://localhost:8280/api/fw/test", fwKey, LIMIT);
     const fwTotal = fwBatch1 + fwBatch2;
 
@@ -98,7 +65,7 @@ async function main() {
     const swKey = `boundary-sw-${Date.now()}`;
     await waitUntilNearWindowBoundary();
     const swBatch1 = await fireBatch("http://localhost:8280/api/sw/test", swKey, LIMIT);
-    await new Promise((r) => setTimeout(r, 300));
+    await sleep(300);
     const swBatch2 = await fireBatch("http://localhost:8280/api/sw/test", swKey, LIMIT);
     const swTotal = swBatch1 + swBatch2;
 
@@ -130,7 +97,7 @@ async function main() {
         `configured limit of ${LIMIT}); sliding window correctly capped the same traffic pattern at ${swTotal}.`
     );
   } finally {
-    cleanup();
+    killAll(upstream, gateway);
   }
 }
 

@@ -1,0 +1,11 @@
+# Provisioned so `docker compose up` produces a working dashboard rather than
+# an empty Grafana asking you to configure a data source by hand.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

@@ -81,7 +81,7 @@ real, apples-to-apples comparison instead of three separate, hard-to-compare run
 | Rate limit store | Redis, atomic counters via Lua scripts (`EVALSHA`, cached automatically by `ioredis`'s `defineCommand`) |
 | Algorithms | Token bucket, sliding window log, fixed window counter — all three, benchmarked against each other |
 | Routing/proxy | `http-proxy-middleware` (Node's `http` under the hood, same idea as `httputil.ReverseProxy`) |
-| Observability | `prom-client` exposing request counts/latency histograms per algorithm; Grafana on top |
+| Observability | `prom-client` exposing per-algorithm request counts, a limiter-check histogram *and* a separate end-to-end histogram, plus fail-open and upstream-error counters; Prometheus + a Grafana dashboard provisioned from this repo |
 | Load testing | k6, with a custom scenario per algorithm sharing a small API-key pool to force real contention |
 | Deployment | Docker Compose locally (two gateway replicas + Redis + mock upstream + Prometheus + Grafana); Render in production |
 
@@ -130,30 +130,104 @@ one in an interview — "sliding window is strictly better" isn't the right answ
 "sliding window is more correct at the boundary but costs O(requests-in-window)
 memory instead of O(1)" is.
 
-### 3. Fail open, not closed, when Redis is unreachable
+### 3. Fail open, not closed — and "fail open" is a latency claim, not just a status code
 
-If the Redis call in the rate-limit check throws (network blip, Redis restart), the
-gateway logs the error and lets the request through rather than returning a 500 (see
-`rateLimitMiddleware.ts`). The reasoning: a rate limiter that's briefly *too
-permissive* during an infrastructure hiccup is a minor, self-correcting problem. A
-gateway that takes its *entire upstream* down because its rate-limit dependency
-sneezed is a much bigger incident, and defeats half the purpose of putting a gateway
-in front of the backend in the first place (protecting it from becoming
-unreachable). This is a real trade-off, not a free choice — a security-sensitive
-endpoint (login attempts, for instance) might reasonably want the opposite: fail
-closed, and reject rather than risk unlimited unauthenticated traffic during an
-outage. Worth stating which one you picked and why, in an interview, rather than
-letting it be an accident.
+If the rate-limit check can't reach Redis, the gateway logs the error and lets the
+request through rather than returning a 500 (see `rateLimitMiddleware.ts`). The
+reasoning: a rate limiter that's temporarily too permissive is a minor, self-correcting
+problem, while a gateway that takes its *entire upstream* down because its rate-limit
+dependency sneezed is a much bigger incident, and defeats half the purpose of putting a
+gateway in front of the backend at all.
+
+The part worth spelling out is that I originally got this wrong while believing I'd got
+it right. The `try/catch` was there and the fallback was correct, but the ioredis client
+was constructed with defaults — and ioredis defaults to `enableOfflineQueue: true` and
+`maxRetriesPerRequest: 20`. Those two settings mean that while Redis is unreachable,
+commands don't fail: they get parked in an in-memory queue and dragged across twenty
+reconnect attempts before the promise ever rejects. The `catch` block was correct and
+almost never ran in time. Pointing a gateway at a dead Redis and timing individual
+requests:
+
+```
+status=200  time=7.09s
+status=200  time=2.50s
+status=000  time=30.00s    ← client gave up first
+```
+
+Every one of those technically failed open. All of them were useless. A gateway adding
+seconds of latency to every request is down, whatever status code it eventually returns —
+and worse than an honest 500, because it's down while looking healthy. **Failing open is
+a latency claim, not just a status-code claim**, and it needs the client configured to
+reject fast (`enableOfflineQueue: false`, `maxRetriesPerRequest: 1`) plus a
+`commandTimeout` to cover the other case — a Redis that's up but slow, where no amount of
+connection handling helps. Same experiment after the fix:
+
+```
+p50 2.3ms   p95 4.0ms   max 8.8ms   (20/20 served)
+```
+
+`scripts/redis-outage-test.mjs` is that experiment, automated and run in CI, so the
+regression can't come back quietly. It also asserts two things I'd consider part of the
+same decision:
+
+- **The fail-open is counted.** `gateway_requests_total{outcome="failed_open"}` and
+  `gateway_limiter_errors_total{reason="timeout"|"unavailable"}`. An *uncounted*
+  fail-open is arguably worse than a hard failure — the gateway silently stops enforcing
+  limits and every dashboard stays green. Responses also carry
+  `X-RateLimit-Enforced: false` so the client knows it wasn't actually limited.
+- **`/health` and `/ready` disagree, on purpose.** Liveness stays 200 during a Redis
+  outage (if it didn't, the orchestrator would restart every replica over a dependency
+  the gateway is specifically built to survive) while readiness returns 503 (the gateway
+  isn't enforcing anything, and shouldn't claim it is).
+
+Fail-open is still a real trade-off, not a free choice — a login endpoint might
+reasonably want the opposite, rejecting rather than risking unlimited unauthenticated
+traffic during an outage. Worth stating which one you picked and why, rather than letting
+it be an accident.
+
+### 4. Measuring the limit check and measuring the request are different questions
+
+The gateway used to record its latency histogram before calling `next()`, which meant the
+number labelled "end-to-end duration including the proxy hop" contained no proxy hop at
+all — just the Redis round-trip. It isn't that the number was wrong; it's that it was
+answering a different question than its name claimed, which is the kind of metric that
+survives review precisely because nobody re-derives what it measures.
+
+There are two questions here and they deserve two histograms:
+
+| | token bucket | sliding window | fixed window |
+|---|---|---|---|
+| `gateway_limiter_check_duration_seconds` (Redis round-trip) | 1.02ms | 0.59ms | 0.54ms |
+| `gateway_request_duration_seconds` (observed on response finish) | 5.91ms | 3.44ms | 3.37ms |
+| difference — the upstream's contribution | 4.89ms | 2.85ms | 2.83ms |
+
+*(means over allowed requests, from the k6 run below.)*
+
+The first column is the only one the gateway is accountable for, and the right number for
+comparing algorithms against each other. The second is what a client actually experiences.
+Reporting the first as if it were the second makes the gateway look ~5x faster than it is.
 
 ## Verifying it yourself
 
-Three scripts exercise the actual running gateway — not mocks — and each one spins up
-its own throwaway gateway/upstream processes on dedicated ports so it can't collide
-with anything else you have running:
+Unit tests cover the limiters directly — each algorithm's boundaries, and an atomicity
+test that fires 50 simultaneous checks at one key and asserts exactly `limit` get
+through (a read-decide-write implementation passes every sequential test and fails that
+one). They run against a real Redis rather than a mock, because the logic under test
+lives inside Lua that Redis executes — a fake client would only be asserting against a
+reimplementation of the thing being tested.
+
+```bash
+npm test                       # limiters + the HTTP header/fail-open contract
+```
+
+Then three scripts exercise the actual running gateway, each spinning up its own
+throwaway gateway/upstream processes on dedicated ports so a run can't collide with
+anything else you have going:
 
 ```bash
 npm run test:multi-instance    # two gateway instances, one Redis: proves the shared limit holds
 npm run test:boundary-burst    # measures fixed window's boundary burst vs sliding window's lack of one
+npm run test:redis-outage      # kills Redis: proves fail-open is fast, counted, and visible in /ready
 ```
 
 And the k6 load test, which needs a gateway actually running first:
@@ -165,10 +239,12 @@ k6 run loadtest/compare-algorithms.js
 ```
 
 Real numbers from a local run (limit=5/10s, 10 VUs per algorithm for 20s each, 5
-shared API keys to force contention): **175 requests allowed, 10,906 correctly
-rejected, 0% actual failure rate** (every response was a valid 200 or 429 — the 429s
-are the rate limiter working, not the gateway breaking), p95 latency 8.6ms including
-the Redis round-trip and proxy hop.
+shared API keys to force contention): **195 requests allowed, 10,928 correctly
+rejected, 0% failure rate** (every response was a valid 200 or 429 — the 429s are the
+rate limiter working, not the gateway breaking), client-observed p95 4.5ms. The
+server-side split behind that number is in decision #4 above.
+
+Everything here runs in CI on every push, against a real Redis service container.
 
 ## Running locally
 
@@ -181,11 +257,30 @@ npm install
 npm run mock-upstream    # terminal 1 — the backend being protected, on :9000
 npm run dev               # terminal 2 — the gateway, on :8080
 
-curl http://localhost:8080/api/tb/hello -H "X-API-Key: demo"   # token bucket
-curl http://localhost:8080/api/sw/hello -H "X-API-Key: demo"   # sliding window
-curl http://localhost:8080/api/fw/hello -H "X-API-Key: demo"   # fixed window
-curl http://localhost:8080/metrics                              # Prometheus format
+curl -i http://localhost:8080/api/tb/hello -H "X-API-Key: demo"   # token bucket
+curl -i http://localhost:8080/api/sw/hello -H "X-API-Key: demo"   # sliding window
+curl -i http://localhost:8080/api/fw/hello -H "X-API-Key: demo"   # fixed window
+
+curl http://localhost:8080/health     # liveness — 200 even if Redis is down
+curl http://localhost:8080/ready      # readiness — 503 when limits aren't being enforced
+curl http://localhost:8080/metrics    # Prometheus format
 ```
+
+Every rate-limited response carries enough for a client to behave well without guessing,
+in both the IETF draft spelling and the de-facto `X-` one:
+
+```
+RateLimit-Limit: 20        # what you get
+RateLimit-Remaining: 17    # what's left right now
+RateLimit-Reset: 8         # seconds until your full budget is back
+Retry-After: 3             # (429s only) seconds until this request would succeed
+```
+
+`Reset` and `Retry-After` answer different questions and are deliberately not the same
+number: a client one token short can retry long before its whole budget returns. For the
+sliding window that retry time comes from when the *oldest* logged request ages out —
+returning the full window instead, the obvious shortcut, tells every client to wait the
+maximum even when it was a millisecond from a free slot.
 
 ## What I'd change at 10x scale
 
@@ -217,6 +312,14 @@ namespace here — `tb:*`/`sw:*`/`fw:*` — doesn't collide with anything else u
 instance). `RATE_LIMIT`, `RATE_WINDOW_SECONDS`, `REDIS_URL`, `UPSTREAM_URL` are set as
 Render environment variables — see `.env.example` for the full list.
 
+**One deployment setting that's a correctness bug if you skip it:** `TRUST_PROXY`. The
+limiter falls back to keying on client IP when no API key is present, and behind a load
+balancer the socket's remote address is the *balancer's* IP for every single client —
+so with the default setting every anonymous caller in the world shares one bucket. Set it
+to the number of proxy hops in front of the gateway (`1` on Render). Not to `true`: that
+trusts the whole `X-Forwarded-For` chain, which lets a client prepend a fake address and
+mint itself a fresh bucket per request.
+
 **Known trade-off of the free-tier deployment:** Render's free web services spin down
 after 15 minutes idle; the first request after that takes ~30-50s to cold-start. If
 the curl command above hangs for a bit on your first try, that's why — not a bug.
@@ -232,6 +335,13 @@ migrations, just the one Redis dependency.
 (`gateway-a`, `gateway-b`) sharing one Redis, a mock upstream, Prometheus scraping
 both replicas, and Grafana on top — `docker compose up` reproduces the multi-instance
 story from decision #1 as an actual running system, not just a test script.
+
+Grafana's datasource and dashboard are provisioned from `grafana/` in this repo, so
+<http://localhost:3000> opens straight onto a populated dashboard rather than an empty
+instance asking you to wire one up by hand. It leads with the number that's easy to miss
+otherwise — requests currently being served *unenforced* because the limiter can't reach
+Redis — alongside the per-algorithm decision rates and the two latency histograms from
+decision #4.
 
 ## License
 

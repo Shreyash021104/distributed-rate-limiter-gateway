@@ -6,7 +6,7 @@
 -- ARGV[3] = now (current time in milliseconds)
 -- ARGV[4] = requested (tokens this request costs, normally 1)
 --
--- Returns: {allowed (0/1), tokens_remaining, retry_after_ms}
+-- Returns: {allowed (0/1), tokens_remaining, retry_after_ms, reset_ms}
 --
 -- Everything below runs as a single atomic operation on the Redis server —
 -- that's the entire point. A naive client-side implementation would GET the
@@ -25,6 +25,10 @@ local capacity = tonumber(ARGV[1])
 local refill_rate = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
 local requested = tonumber(ARGV[4])
+
+if refill_rate <= 0 then
+  return redis.error_reply("refill_rate must be greater than 0")
+end
 
 local bucket = redis.call("HMGET", key, "tokens", "ts")
 local tokens = tonumber(bucket[1])
@@ -49,9 +53,15 @@ else
   retry_after_ms = math.ceil((deficit / refill_rate) * 1000)
 end
 
+-- Time until the bucket is back to full capacity, which is what a
+-- RateLimit-Reset header is supposed to describe. Distinct from
+-- retry_after_ms above, which only covers earning back the one token this
+-- request needed.
+local reset_ms = math.ceil(((capacity - tokens) / refill_rate) * 1000)
+
 redis.call("HMSET", key, "tokens", tokens, "ts", now)
 -- Let the key expire on its own once the bucket would be fully idle for a
 -- while, so we don't accumulate keys for API keys that stop sending traffic.
 redis.call("PEXPIRE", key, math.ceil((capacity / refill_rate) * 1000) + 1000)
 
-return { allowed, tostring(tokens), retry_after_ms }
+return { allowed, tostring(tokens), retry_after_ms, reset_ms }
